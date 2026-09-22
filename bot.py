@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 from datetime import datetime, time as dt_time, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -47,6 +47,21 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _resolve_timezone(name: str, default: str = "UTC") -> ZoneInfo:
+    value = os.environ.get(name, default)
+    try:
+        return ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.error(
+            "Invalid %s=%r - must be an IANA timezone name, e.g. America/Chicago, "
+            "Europe/London, Asia/Tokyo, or UTC. Full list: "
+            "https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+            name,
+            value,
+        )
+        sys.exit(1)
+
+
 BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(_require_env("TELEGRAM_CHAT_ID"))
 GOOGLE_SHEET_ID = _require_env("GOOGLE_SHEET_ID")
@@ -55,7 +70,7 @@ CHECKIN_INTERVAL_MINUTES = float(os.environ.get("CHECKIN_INTERVAL_MINUTES", "30"
 # If a check-in prompt goes unanswered this long, auto-resolve it as "No" (pause).
 # Kept a hair under the interval so a stale prompt always resolves before the next one fires.
 CHECKIN_TIMEOUT_MINUTES = max(CHECKIN_INTERVAL_MINUTES - 1, 0.5)
-TIMEZONE = ZoneInfo(os.environ.get("TZ", "UTC"))
+TIMEZONE = _resolve_timezone("TZ")
 PERSISTENCE_PATH = os.environ.get("PERSISTENCE_PATH", "/app/data/bot_persistence.pickle")
 GOOGLE_CREDS_FILE = os.environ.get(
     "GOOGLE_SHEETS_CREDENTIALS_FILE", "/app/credentials/service_account.json"
