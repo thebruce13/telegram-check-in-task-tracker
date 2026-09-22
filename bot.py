@@ -131,6 +131,15 @@ def _accumulate_and_pop_active(chat_data: dict) -> float:
     if active_since:
         accumulated += (datetime.now(TIMEZONE) - active_since).total_seconds()
     chat_data["accumulated_seconds"] = accumulated
+    return chat_data["accumulated_seconds"]
+
+
+def _current_elapsed_seconds(chat_data: dict) -> float:
+    """Read-only: total active time accrued so far, including any in-progress stretch."""
+    accumulated = chat_data.get("accumulated_seconds", 0.0)
+    active_since = chat_data.get("active_since")
+    if active_since:
+        accumulated += (datetime.now(TIMEZONE) - active_since).total_seconds()
     return accumulated
 
 
@@ -239,6 +248,7 @@ async def start_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_n
     chat_data["status"] = "active"
     chat_data["accumulated_seconds"] = 0.0
     chat_data["active_since"] = datetime.now(TIMEZONE)
+    chat_data["session_started_at"] = chat_data["active_since"]
     chat_data.pop("awaiting_new_task_name", None)
     try:
         row = await asyncio.to_thread(SHEETS.append_active, task_name, now_date_str(), now_time_str())
@@ -494,14 +504,27 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    task = context.chat_data.get("current_task")
-    status = context.chat_data.get("status", "inactive")
-    if task:
-        await update.message.reply_text(
-            f"Current task: *{task}*\nStatus: {status}", parse_mode=ParseMode.MARKDOWN
-        )
-    else:
+    chat_data = context.chat_data
+    task = chat_data.get("current_task")
+    status = chat_data.get("status", "inactive")
+    if not task:
         await update.message.reply_text("No task set. Use /task <name> to start.")
+        return
+
+    lines = [f"Current task: *{task}*", f"Status: {status}"]
+
+    # Older sessions (started before this field existed) fall back to active_since,
+    # which is exact as long as the session hasn't been paused/resumed since.
+    started_at = chat_data.get("session_started_at") or chat_data.get("active_since")
+    if started_at:
+        lines.append(f"Started: {started_at.strftime('%a %b %d, %I:%M %p')}")
+
+    if status in ("active", "paused"):
+        elapsed = format_duration(_current_elapsed_seconds(chat_data))
+        suffix = " (still counting)" if status == "active" else " (paused)"
+        lines.append(f"Time on task: {elapsed}{suffix}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 # --------------------------------------------------------------------------

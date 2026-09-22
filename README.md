@@ -230,8 +230,9 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
 - `/resume` (alias: `/start`) — if a task is currently `Paused`, logs it
   `Active` again (duration keeps accumulating from where it left off, not
   reset) and restarts the check-in loop; otherwise tells you to use `/task`.
-- `/status` — shows the current task and whether it's active, paused, or
-  inactive.
+- `/status` — shows the current task, whether it's active, paused, or
+  inactive, when it started, and how long you've been on it so far
+  (cumulative across any pause/resume cycles, still ticking while active).
 
 From there, just respond to the periodic Yes/No prompts. Every task gets one
 row in your Google Sheet that's updated in place as it changes state:
