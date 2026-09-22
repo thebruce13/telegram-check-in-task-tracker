@@ -1,8 +1,8 @@
-# TelCheck
+# Telegram Check-In
 
 A self-hosted Telegram bot that periodically asks whether you're still working
 on your current task, and logs your answers to a Google Sheet. Runs in Docker
-on your home server.
+on your home server. Everything was vibe-coded even this readme, fight me.
 
 ## How it works
 
