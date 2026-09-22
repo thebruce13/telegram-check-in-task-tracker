@@ -1,0 +1,10 @@
+services:
+  telcheck:
+    build: .
+    container_name: telcheck
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./credentials:/app/credentials:ro
