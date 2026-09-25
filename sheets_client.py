@@ -1,8 +1,10 @@
 """Thin wrapper around gspread for logging one row per task session.
 
 A session's row is appended when the task goes Active, then edited in place
-(status + duration + stopped-at) as it moves through Paused/Active/Inactive,
-rather than appending a new row for every status change.
+(status + stopped-at) as it moves through Paused/Active/Inactive, rather than
+appending a new row for every status change. Duration is never written by
+this code - it's a sheet formula (D-A-B) set once at row creation, so it's
+wall-clock time from start to Stopped At, not active-only time.
 
 Columns: Date | Time | Task | Stopped At | Duration | Activity (Status)
 """
@@ -32,9 +34,24 @@ class SheetsClient:
             logger.info("Worksheet %s not found, creating it", worksheet_name)
             self.worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=6)
             self.worksheet.append_row(HEADER)
+            self._ensure_column_formats()
             return
 
         self._migrate_schema()
+        self._ensure_column_formats()
+
+    def _ensure_column_formats(self) -> None:
+        """Display formats for the two computed/stamped columns.
+
+        Duration (E): `[h]:mm:ss`, bracketed so a session spanning more than 24
+        hours accumulates hours instead of wrapping like a time-of-day.
+
+        Stopped At (D): time-only, 12-hour with AM/PM (e.g. 11:33:03 AM) - the
+        cell's underlying value still carries the full date, this only hides
+        it from the display so the column reads as a plain time.
+        """
+        self.worksheet.format("D2:D", {"numberFormat": {"type": "TIME", "pattern": "h:mm:ss AM/PM"}})
+        self.worksheet.format("E2:E", {"numberFormat": {"type": "TIME", "pattern": "[h]:mm:ss"}})
 
     def _migrate_schema(self) -> None:
         """Bring an older sheet layout up to Date/Time/Task/Status/Duration/Stopped At.
@@ -68,19 +85,31 @@ class SheetsClient:
         )
 
     def append_active(self, task: str, date_str: str, time_str: str) -> Optional[int]:
-        """Start a new session row (Active, blank duration/stopped-at). Returns its row number."""
+        """Start a new session row (Active, blank stopped-at). Returns its row number.
+
+        Also seeds the Duration formula for this row - it evaluates blank until
+        Stopped At is filled in later, then self-updates from then on.
+        """
         response = self.worksheet.append_row(
             [date_str, time_str, task or "", "", "", "Active"],
             value_input_option="USER_ENTERED",
             table_range="A:F",
         )
-        return self._row_from_append_response(response)
+        row = self._row_from_append_response(response)
+        if row is not None:
+            self.worksheet.update(
+                f"E{row}", [[self._duration_formula(row)]], value_input_option="USER_ENTERED"
+            )
+        return row
 
-    def update_status(self, row: int, status: str, duration: str = "", stopped_at: str = "") -> None:
-        """Edit an existing session row's Stopped At/Duration/Activity cells (D:F) in place."""
-        self.worksheet.update(
-            f"D{row}:F{row}", [[stopped_at, duration, status]], value_input_option="USER_ENTERED"
-        )
+    def update_status(self, row: int, status: str, stopped_at: str = "") -> None:
+        """Edit an existing session row's Stopped At/Activity cells (D and F) in place.
+
+        Duration (E) is left untouched - it's a formula seeded by append_active
+        that recalculates on its own once Stopped At changes.
+        """
+        self.worksheet.update(f"D{row}", [[stopped_at]], value_input_option="USER_ENTERED")
+        self.worksheet.update(f"F{row}", [[status]], value_input_option="USER_ENTERED")
 
     def update_task_name(self, row: int, task_name: str) -> None:
         """Relabel an existing session row's Task cell (column C) in place."""
@@ -92,15 +121,24 @@ class SheetsClient:
         status: str,
         date_str: str,
         time_str: str,
-        duration: str = "",
         stopped_at: str = "",
     ) -> None:
-        """Fallback: append a standalone row when there's no session row to edit."""
-        self.worksheet.append_row(
-            [date_str, time_str, task or "", stopped_at, duration, status],
+        """Fallback: append a standalone, already-closed row when there's no session row to edit."""
+        response = self.worksheet.append_row(
+            [date_str, time_str, task or "", stopped_at, "", status],
             value_input_option="USER_ENTERED",
             table_range="A:F",
         )
+        row = self._row_from_append_response(response)
+        if row is not None:
+            self.worksheet.update(
+                f"E{row}", [[self._duration_formula(row)]], value_input_option="USER_ENTERED"
+            )
+
+    @staticmethod
+    def _duration_formula(row: int) -> str:
+        # Wall-clock: Stopped At minus Date+Time, blank while Stopped At is blank.
+        return f'=IF(D{row}="","",D{row}-A{row}-B{row})'
 
     def delete_zero_duration_rows(self) -> int:
         """Delete every Inactive row with a Duration of exactly 0:00:00.

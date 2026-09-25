@@ -42,15 +42,18 @@ on your home server. Everything was vibe-coded even this readme, fight me.
   never deleted, even at `0:00:00`, since a paused task is still resumable.
 - Every row logged to the sheet has one of three statuses: `Active`,
   `Paused`, or `Inactive`.
-- Every row that closes out a task (`Paused` or `Inactive`) also gets a
-  **`Duration`** column: total active time worked on the task across the
-  session, formatted `H:MM:SS`, cumulative across any pause/resume cycles.
-  `Active` rows leave it blank since the session is still ongoing. Time
-  spent while paused doesn't count toward it.
-- A **`Stopped At`** column is filled in with a full date+time only when a
-  task is logged `Inactive` — i.e. genuinely done, not just paused — whether
-  that's via `/stop`, switching tasks with `/task <name>`, or the midnight
-  sweep. `Active` and `Paused` rows leave it blank.
+- A **`Stopped At`** column is filled in (with a full date+time, though the
+  sheet only *displays* the time — see column formats below) whenever a
+  session stops accumulating time: `Paused` **or** `Inactive`. It's blank
+  only while `Active` (still ongoing), and gets cleared back to blank when a
+  `Paused` row is resumed to `Active`.
+- **`Duration`** is a live spreadsheet formula (`=IF(D="","",D-A-B)`), not
+  something the bot writes — it's seeded once when the row is created and
+  recalculates on its own whenever `Stopped At` changes. That makes it
+  **wall-clock time** from start to `Stopped At`, including any time spent
+  `Paused` — a different number than the "time on task" `/status` reports in
+  Telegram, which still excludes paused stretches (computed separately, not
+  from the sheet). `Active` rows show blank since `Stopped At` is blank.
 - State (current task, active/paused/inactive, and the active-since
   timestamp) is persisted to disk, so a container restart resumes exactly
   where it left off, duration tracking included.
@@ -215,6 +218,16 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
   answering **No** cancels the switch. If nothing is currently active (or the
   current task is only paused), sets the new task directly with no
   confirmation, closing out whatever was current as `Inactive`.
+  - **Optional leading time:** `/task 1:32pm digging a hole` (also accepts
+    `1:32 pm`, `1pm`, or 24-hour `13:32`) backdates the row's start time to
+    that time today, instead of now — for when you forgot to start tracking
+    right away. Must be earlier than now and not earlier than when your last
+    task stopped (otherwise it'd overlap another row — use `/was` for that
+    case instead). The check-in loop itself still counts
+    `CHECKIN_INTERVAL_MINUTES` from *now*, not from the backdated time. A
+    task name that happens to start with a bare number (`/task 5 minute
+    break`) is left alone — only a colon or an am/pm marker is treated as a
+    time, to avoid misreading task names.
 - `/rename <new name>` — relabel the current task in place. Unlike `/task`,
   this doesn't close anything out or ask for confirmation: it's the same
   session, same row, same running duration — just a new name (useful for
@@ -233,15 +246,30 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
 - `/status` — shows the current task, whether it's active, paused, or
   inactive, when it started, and how long you've been on it so far
   (cumulative across any pause/resume cycles, still ticking while active).
+- `/was <task name>` — backfill a task you forgot to track, for the gap of
+  time between now and whenever tracking last stopped (via `/pause`,
+  `/stop`, or an unanswered check-in), capped at `CHECKIN_INTERVAL_MINUTES`
+  so it never reaches further back than the bot could actually vouch for.
+  Shows a Yes/No confirmation with the computed start/end times before
+  writing anything. Logs a single already-`Inactive` row directly — it
+  doesn't touch whatever's currently paused/stopped, and doesn't start a
+  check-in loop. Only works when nothing is currently *active* (if
+  something is, there's no gap to fill — `/pause` or `/stop` it first).
+  Example: you ran `/task cleanup` 1:00–1:30pm, then stopped responding to
+  check-ins; at 1:45pm you run `/was "making a mess"` — it logs "making a
+  mess" from 1:30pm (when `cleanup` was last known to stop) to 1:45pm (now).
 
 From there, just respond to the periodic Yes/No prompts. Every task gets one
 row in your Google Sheet that's updated in place as it changes state:
 `Date | Time | Task | Stopped At | Duration | Activity` (`Activity` is
-`Active`, `Paused`, or `Inactive`; `Duration` is cumulative `H:MM:SS`, filled
-in on `Paused`/`Inactive` rows; `Stopped At` is filled in only on `Inactive`
-rows). Column *position* is what the bot actually relies on, not the header
-labels — relabeling a header is safe, but reordering columns in the sheet
-requires a matching code change to the column letters in `sheets_client.py`.
+`Active`, `Paused`, or `Inactive`; `Stopped At` is filled in on `Paused`/
+`Inactive` rows, displayed time-only as e.g. `11:33:03 AM` even though the
+cell's underlying value still carries the date; `Duration` is a formula —
+`Stopped At` minus `Date`+`Time`, wall-clock, displayed `[h]:mm:ss` — blank
+on `Active` rows since `Stopped At` is blank). Column *position* is what the
+bot actually relies on, not the header labels — relabeling a header is safe,
+but reordering columns in the sheet requires a matching code change to the
+column letters in `sheets_client.py`.
 
 ## 6. Operational notes
 

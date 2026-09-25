@@ -9,6 +9,7 @@ import asyncio
 import functools
 import logging
 import os
+import re
 import sys
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -92,6 +93,8 @@ CB_TRACK_YES = "track:yes"
 CB_TRACK_NO = "track:no"
 CB_SWITCH_YES = "switch:yes"
 CB_SWITCH_NO = "switch:no"
+CB_WAS_YES = "was:yes"
+CB_WAS_NO = "was:no"
 
 JOB_NAME_PREFIX = "checkin_"
 TIMEOUT_JOB_NAME_PREFIX = "checkin_timeout_"
@@ -105,23 +108,90 @@ def checkin_timeout_job_name(chat_id: int) -> str:
     return f"{TIMEOUT_JOB_NAME_PREFIX}{chat_id}"
 
 
-def now_str() -> str:
+def format_timestamp(dt: datetime) -> str:
     # Plain "YYYY-MM-DD HH:MM:SS" (no offset) so Google Sheets parses it as a
     # real datetime value under USER_ENTERED, instead of storing it as text.
     # Used for the Stopped At column, which needs a full date+time.
-    return datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_date(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def format_time(dt: datetime) -> str:
+    return dt.strftime("%H:%M:%S")
+
+
+def now_str() -> str:
+    return format_timestamp(datetime.now(TIMEZONE))
 
 
 def now_date_str() -> str:
-    return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    return format_date(datetime.now(TIMEZONE))
 
 
 def now_time_str() -> str:
-    return datetime.now(TIMEZONE).strftime("%H:%M:%S")
+    return format_time(datetime.now(TIMEZONE))
 
 
 def format_duration(total_seconds: float) -> str:
     return str(timedelta(seconds=int(total_seconds)))
+
+
+# Requires a colon or an am/pm marker - a bare number like "5" is too likely
+# to be the start of a task name (e.g. "/task 5 minute break") to treat as a time.
+_TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?$", re.IGNORECASE)
+_MERIDIEM_ONLY_RE = re.compile(r"^[ap]\.?m\.?$", re.IGNORECASE)
+
+
+def parse_clock_time(token: str, tz: ZoneInfo) -> "datetime | None":
+    """Parse a HH:MM[am/pm] time-of-day token as today's date in tz. None if it doesn't look like one."""
+    match = _TIME_RE.match(token.strip())
+    if not match:
+        return None
+    hour_str, minute_str, meridiem = match.groups()
+    if minute_str is None and not meridiem:
+        return None
+    hour = int(hour_str)
+    minute = int(minute_str or 0)
+    meridiem = (meridiem or "").lower().replace(".", "")
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+    elif not 0 <= hour <= 23:
+        return None
+    if not 0 <= minute <= 59:
+        return None
+    return datetime.now(tz).replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def extract_leading_time(args: list, tz: ZoneInfo) -> tuple:
+    """Pull a leading time-of-day off a command's args (e.g. /task 1:32pm digging a hole).
+
+    Handles both "1:32pm" as one token and "1:32 pm" split across two by the
+    normal whitespace tokenizing. Returns (start_time_or_None, remaining_args).
+    """
+    if not args:
+        return None, args
+    # If the second token is a bare am/pm marker, it belongs with the first -
+    # check that combination before treating the first token alone as 24-hour.
+    if len(args) >= 2 and _MERIDIEM_ONLY_RE.match(args[1].strip()):
+        start_time = parse_clock_time(args[0] + args[1], tz)
+        if start_time is not None:
+            return start_time, args[2:]
+    start_time = parse_clock_time(args[0], tz)
+    if start_time is not None:
+        return start_time, args[1:]
+    if len(args) >= 2:
+        start_time = parse_clock_time(args[0] + args[1], tz)
+        if start_time is not None:
+            return start_time, args[2:]
+    return None, args
 
 
 def _accumulate_and_pop_active(chat_data: dict) -> float:
@@ -213,45 +283,55 @@ async def log_to_sheet(
     chat_id: int,
     task: str,
     status: str,
-    duration: str = "",
     stopped_at: str = "",
 ) -> None:
     """Fallback: append a standalone row. Used only when there's no session row to edit."""
     try:
         await asyncio.to_thread(
-            SHEETS.log_entry, task, status, now_date_str(), now_time_str(), duration, stopped_at
+            SHEETS.log_entry, task, status, now_date_str(), now_time_str(), stopped_at
         )
     except Exception:
         await _notify_sheet_error(context, chat_id, task, status)
 
 
 async def update_session_status(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, task: str, row: "int | None", status: str, duration: str
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, task: str, row: "int | None", status: str
 ) -> None:
-    # "Fully stopped" means Inactive - Paused stays resumable, so it gets no Stopped At stamp.
-    stopped_at = now_str() if status == "Inactive" else ""
+    # Stamped whenever the row stops accumulating time - Paused (still resumable)
+    # as well as Inactive (done for good). Active leaves it blank (still ongoing).
+    stopped_at = now_str() if status in ("Inactive", "Paused") else ""
     if row is not None:
         try:
-            await asyncio.to_thread(SHEETS.update_status, row, status, duration, stopped_at)
+            await asyncio.to_thread(SHEETS.update_status, row, status, stopped_at)
             return
         except Exception:
             await _notify_sheet_error(context, chat_id, task, status)
             return
     # No row reference (e.g. a previous append failed) - don't lose the event.
-    await log_to_sheet(context, chat_id, task, status, duration, stopped_at)
+    await log_to_sheet(context, chat_id, task, status, stopped_at)
 
 
-async def start_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_name: str) -> None:
-    """Append a new Active row for task_name and initialize its session tracking."""
+async def start_session(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_name: str, start_time: "datetime | None" = None
+) -> None:
+    """Append a new Active row for task_name and initialize its session tracking.
+
+    start_time backdates the row's Date/Time and the active-since clock (e.g.
+    from /task 1:32pm <name>); defaults to now. The check-in loop itself
+    always counts CHECKIN_INTERVAL_MINUTES from now, regardless.
+    """
     chat_data = context.chat_data
+    start_time = start_time or datetime.now(TIMEZONE)
     chat_data["current_task"] = task_name
     chat_data["status"] = "active"
     chat_data["accumulated_seconds"] = 0.0
-    chat_data["active_since"] = datetime.now(TIMEZONE)
-    chat_data["session_started_at"] = chat_data["active_since"]
+    chat_data["active_since"] = start_time
+    chat_data["session_started_at"] = start_time
     chat_data.pop("awaiting_new_task_name", None)
     try:
-        row = await asyncio.to_thread(SHEETS.append_active, task_name, now_date_str(), now_time_str())
+        row = await asyncio.to_thread(
+            SHEETS.append_active, task_name, format_date(start_time), format_time(start_time)
+        )
     except Exception:
         row = None
         await _notify_sheet_error(context, chat_id, task_name, "Active")
@@ -263,37 +343,39 @@ async def close_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int, final_
     """Fold in any in-progress active time and set the session row to its final status."""
     chat_data = context.chat_data
     task_name = chat_data.get("current_task")
-    accumulated = _accumulate_and_pop_active(chat_data)
-    duration = format_duration(accumulated)
+    _accumulate_and_pop_active(chat_data)
     row = chat_data.pop("session_row", None)
     chat_data.pop("accumulated_seconds", None)
-    await update_session_status(context, chat_id, task_name, row, final_status, duration)
+    chat_data["last_stopped_at"] = datetime.now(TIMEZONE)
+    await update_session_status(context, chat_id, task_name, row, final_status)
 
 
 async def pause_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Set the session row to Paused with the duration accrued so far; stays resumable."""
+    """Set the session row to Paused; stays resumable. Sheet Duration keeps running (wall-clock)."""
     chat_data = context.chat_data
     task_name = chat_data.get("current_task")
-    accumulated = _accumulate_and_pop_active(chat_data)
-    duration = format_duration(accumulated)
+    _accumulate_and_pop_active(chat_data)
     row = chat_data.get("session_row")
-    await update_session_status(context, chat_id, task_name, row, "Paused", duration)
+    chat_data["last_stopped_at"] = datetime.now(TIMEZONE)
+    await update_session_status(context, chat_id, task_name, row, "Paused")
 
 
 async def resume_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Flip the session row back to Active (blank duration) and restart the active clock."""
+    """Flip the session row back to Active (clears Stopped At) and restart the active clock."""
     chat_data = context.chat_data
     task_name = chat_data.get("current_task")
     chat_data["active_since"] = datetime.now(TIMEZONE)
     row = chat_data.get("session_row")
-    await update_session_status(context, chat_id, task_name, row, "Active", "")
+    await update_session_status(context, chat_id, task_name, row, "Active")
 
 
-async def set_new_task(context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_name: str) -> None:
+async def set_new_task(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, task_name: str, start_time: "datetime | None" = None
+) -> None:
     previous_task = context.chat_data.get("current_task")
     if previous_task and previous_task != task_name:
         await close_session(context, chat_id, "Inactive")
-    await start_session(context, chat_id, task_name)
+    await start_session(context, chat_id, task_name, start_time)
 
 
 # --------------------------------------------------------------------------
@@ -404,18 +486,46 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+def _now_tracking_text(task_name: str, start_time: "datetime | None") -> str:
+    when = f" (started at {start_time.strftime('%I:%M %p')})" if start_time else ""
+    return f"Now tracking *{task_name}*{when}. I'll check in every {CHECKIN_INTERVAL_MINUTES:g} minutes."
+
+
 @restricted
 async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if not context.args:
-        await update.message.reply_text("Usage: /task <task name>")
+        await update.message.reply_text("Usage: /task [HH:MMam/pm] <task name>")
         return
-    new_task_name = " ".join(context.args).strip()
+
+    start_time, remaining_args = extract_leading_time(context.args, TIMEZONE)
+    if start_time is not None:
+        if not remaining_args:
+            await update.message.reply_text("Usage: /task [HH:MMam/pm] <task name>")
+            return
+        now = datetime.now(TIMEZONE)
+        if start_time > now:
+            await update.message.reply_text(
+                f"{start_time.strftime('%I:%M %p')} is in the future — /task can only "
+                "backdate to a time earlier today."
+            )
+            return
+        last_stopped_at = context.chat_data.get("last_stopped_at")
+        if last_stopped_at and start_time < last_stopped_at:
+            await update.message.reply_text(
+                f"That's earlier than when your last task stopped "
+                f"({last_stopped_at.strftime('%I:%M %p')}) — it would overlap. Use a later "
+                "time, or /was to backfill the gap instead."
+            )
+            return
+
+    new_task_name = " ".join(remaining_args if start_time is not None else context.args).strip()
     current_task = context.chat_data.get("current_task")
     current_status = context.chat_data.get("status")
 
     if current_task and current_status == "active" and current_task != new_task_name:
         context.chat_data["pending_task_name"] = new_task_name
+        context.chat_data["pending_task_start_time"] = start_time
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -429,11 +539,8 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    await set_new_task(context, chat_id, new_task_name)
-    await update.message.reply_text(
-        f"Now tracking *{new_task_name}*. I'll check in every {CHECKIN_INTERVAL_MINUTES:g} minutes.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await set_new_task(context, chat_id, new_task_name, start_time)
+    await update.message.reply_text(_now_tracking_text(new_task_name, start_time), parse_mode=ParseMode.MARKDOWN)
 
 
 @restricted
@@ -527,6 +634,44 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+@restricted
+async def cmd_was(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Usage: /was <task name>")
+        return
+    task_name = " ".join(context.args).strip()
+
+    if context.chat_data.get("status") == "active":
+        await update.message.reply_text(
+            "You're actively tracking something right now, so there's no gap to backfill. "
+            "Use /pause or /stop first, then /was."
+        )
+        return
+
+    now = datetime.now(TIMEZONE)
+    cap_start = now - timedelta(minutes=CHECKIN_INTERVAL_MINUTES)
+    last_stopped_at = context.chat_data.get("last_stopped_at")
+    start = max(cap_start, last_stopped_at) if last_stopped_at else cap_start
+
+    if start >= now:
+        await update.message.reply_text("No time gap to backfill — you're all caught up.")
+        return
+
+    duration = format_duration((now - start).total_seconds())
+    context.chat_data["pending_was"] = {"task": task_name, "start": start, "end": now, "duration": duration}
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Yes", callback_data=CB_WAS_YES), InlineKeyboardButton("No", callback_data=CB_WAS_NO)]]
+    )
+    await update.message.reply_text(
+        f"Log *{task_name}* from {start.strftime('%a %I:%M %p')} to "
+        f"{now.strftime('%a %I:%M %p')} ({duration})?",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # --------------------------------------------------------------------------
 # Callback query handlers
 # --------------------------------------------------------------------------
@@ -585,22 +730,55 @@ async def on_switch_response(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     chat_id = query.message.chat_id
     pending_task_name = context.chat_data.pop("pending_task_name", None)
+    pending_start_time = context.chat_data.pop("pending_task_start_time", None)
     current_task = context.chat_data.get("current_task")
 
     if query.data == CB_SWITCH_YES:
         if not pending_task_name:
             await query.edit_message_text("Something went wrong — please run /task again.")
             return
-        await set_new_task(context, chat_id, pending_task_name)
+        await set_new_task(context, chat_id, pending_task_name, pending_start_time)
         await query.edit_message_text(
-            f"Now tracking *{pending_task_name}*. I'll check in every "
-            f"{CHECKIN_INTERVAL_MINUTES:g} minutes.",
-            parse_mode=ParseMode.MARKDOWN,
+            _now_tracking_text(pending_task_name, pending_start_time), parse_mode=ParseMode.MARKDOWN
         )
     else:
         await query.edit_message_text(
             f"Okay, staying on *{current_task}*.", parse_mode=ParseMode.MARKDOWN
         )
+
+
+@restricted
+async def on_was_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    pending = context.chat_data.pop("pending_was", None)
+
+    if query.data == CB_WAS_YES:
+        if not pending:
+            await query.edit_message_text("Something went wrong — please run /was again.")
+            return
+        task_name, start, end, duration = pending["task"], pending["start"], pending["end"], pending["duration"]
+        try:
+            await asyncio.to_thread(
+                SHEETS.log_entry,
+                task_name,
+                "Inactive",
+                format_date(start),
+                format_time(start),
+                format_timestamp(end),
+            )
+        except Exception:
+            await _notify_sheet_error(context, chat_id, task_name, "Inactive")
+            return
+        context.chat_data["last_stopped_at"] = end
+        await query.edit_message_text(
+            f"Logged *{task_name}* from {start.strftime('%a %I:%M %p')} to "
+            f"{end.strftime('%a %I:%M %p')} ({duration}).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        await query.edit_message_text("Okay, discarded.")
 
 
 @restricted
@@ -646,11 +824,10 @@ async def end_of_day_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
     for chat_id, data in application.chat_data.items():
         if data.get("status") == "paused" and data.get("current_task"):
             task = data.get("current_task")
-            duration = format_duration(data.get("accumulated_seconds", 0.0))
             row = data.pop("session_row", None)
             data.pop("accumulated_seconds", None)
             data["status"] = "inactive"
-            await update_session_status(context, chat_id, task, row, "Inactive", duration)
+            await update_session_status(context, chat_id, task, row, "Inactive")
             logger.info("End-of-day sweep: marked %r inactive for chat %s", task, chat_id)
 
     try:
@@ -684,6 +861,7 @@ def main() -> None:
     application.add_handler(CommandHandler("pause", cmd_pause))
     application.add_handler(CommandHandler("stop", cmd_stop))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("was", cmd_was))
     application.add_handler(
         CallbackQueryHandler(on_checkin_response, pattern=f"^(?:{CB_CHECKIN_YES}|{CB_CHECKIN_NO})$")
     )
@@ -692,6 +870,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(on_switch_response, pattern=f"^(?:{CB_SWITCH_YES}|{CB_SWITCH_NO})$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(on_was_response, pattern=f"^(?:{CB_WAS_YES}|{CB_WAS_NO})$")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
     application.add_error_handler(on_error)
