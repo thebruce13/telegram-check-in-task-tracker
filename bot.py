@@ -91,8 +91,6 @@ CB_CHECKIN_YES = "checkin:yes"
 CB_CHECKIN_NO = "checkin:no"
 CB_TRACK_YES = "track:yes"
 CB_TRACK_NO = "track:no"
-CB_SWITCH_YES = "switch:yes"
-CB_SWITCH_NO = "switch:no"
 CB_WAS_YES = "was:yes"
 CB_WAS_NO = "was:no"
 
@@ -520,24 +518,6 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     new_task_name = " ".join(remaining_args if start_time is not None else context.args).strip()
-    current_task = context.chat_data.get("current_task")
-    current_status = context.chat_data.get("status")
-
-    if current_task and current_status == "active" and current_task != new_task_name:
-        context.chat_data["pending_task_name"] = new_task_name
-        context.chat_data["pending_task_start_time"] = start_time
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Yes", callback_data=CB_SWITCH_YES),
-                    InlineKeyboardButton("No", callback_data=CB_SWITCH_NO),
-                ]
-            ]
-        )
-        await update.message.reply_text(
-            f"Are you done with *{current_task}*?", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN
-        )
-        return
 
     await set_new_task(context, chat_id, new_task_name, start_time)
     await update.message.reply_text(_now_tracking_text(new_task_name, start_time), parse_mode=ParseMode.MARKDOWN)
@@ -725,29 +705,6 @@ async def on_track_response(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 @restricted
-async def on_switch_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    pending_task_name = context.chat_data.pop("pending_task_name", None)
-    pending_start_time = context.chat_data.pop("pending_task_start_time", None)
-    current_task = context.chat_data.get("current_task")
-
-    if query.data == CB_SWITCH_YES:
-        if not pending_task_name:
-            await query.edit_message_text("Something went wrong — please run /task again.")
-            return
-        await set_new_task(context, chat_id, pending_task_name, pending_start_time)
-        await query.edit_message_text(
-            _now_tracking_text(pending_task_name, pending_start_time), parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await query.edit_message_text(
-            f"Okay, staying on *{current_task}*.", parse_mode=ParseMode.MARKDOWN
-        )
-
-
-@restricted
 async def on_was_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -867,9 +824,6 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(on_track_response, pattern=f"^(?:{CB_TRACK_YES}|{CB_TRACK_NO})$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(on_switch_response, pattern=f"^(?:{CB_SWITCH_YES}|{CB_SWITCH_NO})$")
     )
     application.add_handler(
         CallbackQueryHandler(on_was_response, pattern=f"^(?:{CB_WAS_YES}|{CB_WAS_NO})$")

@@ -23,12 +23,9 @@ on your home server. Everything was vibe-coded even this readme, fight me.
     current, and restarts the 30-minute loop from now.
   - **No** → logs `(timestamp, task, "Paused")`, cancels all reminders, and
     stays silent until you send `/resume`, `/start`, or `/task <name>`.
-- Running `/task <name>` while a different task is currently **active** first
-  asks *"Are you done with **&lt;current task&gt;**?"* — **Yes** logs the old
-  task `Inactive`, logs the new one `Active`, and restarts the loop; **No**
-  cancels the switch and keeps the current task running. If the current task
-  is merely paused (or nothing is set), `/task <name>` switches immediately
-  with no confirmation, closing out the old one as `Inactive`.
+- Running `/task <name>` always switches immediately, no confirmation —
+  whatever was current (active, paused, or nothing) gets logged `Inactive`
+  and the new task starts `Active`, restarting the 30-minute loop.
 - **`Paused` is resumable, `Inactive` is not.** A paused task picks back up
   as `Active` via `/resume`/`/start`. Once a task is logged `Inactive` (by
   switching tasks, or by the midnight sweep below), it's done — start a new
@@ -211,13 +208,10 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
 
 ## 5. Usage
 
-- `/task <task name>` — set (or switch) the current task. If you're already
-  actively tracking something else, first asks *"Are you done with
-  &lt;current task&gt;?"*; answering **Yes** logs it `Inactive`, logs the new
-  task `Active`, and (re)starts the 30-minute check-in loop counting from now;
-  answering **No** cancels the switch. If nothing is currently active (or the
-  current task is only paused), sets the new task directly with no
-  confirmation, closing out whatever was current as `Inactive`.
+- `/task <task name>` — set (or switch) the current task, immediately, no
+  confirmation — whatever was current (active, paused, or nothing) is logged
+  `Inactive`, the new task starts `Active`, and the 30-minute check-in loop
+  (re)starts counting from now.
   - **Optional leading time:** `/task 1:32pm digging a hole` (also accepts
     `1:32 pm`, `1pm`, or 24-hour `13:32`) backdates the row's start time to
     that time today, instead of now — for when you forgot to start tracking
