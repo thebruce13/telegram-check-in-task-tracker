@@ -168,6 +168,8 @@ bot.
 TelCheck/
 ├── bot.py                  # Main application
 ├── sheets_client.py        # Google Sheets wrapper
+├── scripts/
+│   └── setup_categories_tab.py  # One-off: (re)creates the Categories tab
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -264,6 +266,28 @@ on `Active` rows since `Stopped At` is blank). Column *position* is what the
 bot actually relies on, not the header labels — relabeling a header is safe,
 but reordering columns in the sheet requires a matching code change to the
 column letters in `sheets_client.py`.
+
+### Categories
+
+Prefix a task name with `category:` (e.g. `/task work: standup`, `/task
+health: brush teeth`) and it'll show up broken out by category in a separate
+**`Categories`** tab, alongside `Sheet1` in the same spreadsheet — total time
+per category, plus a grand total. There's no fixed list of categories
+anywhere in the code: the tab reads `Sheet1` live via a formula that groups
+by whatever text comes before the first `:` in each task name (normalized so
+`Work:`/`work:`/` Work :` all group together), so a brand new prefix you've
+never used before just starts showing up on its own — no bot code change or
+redeploy needed. Anything without a `:` falls into `Uncategorized`.
+
+This tab is entirely formula-driven and reads from `Sheet1` — the bot never
+writes to it. It only needs to exist once; `scripts/setup_categories_tab.py`
+creates it (or resets it, if you ever delete the tab or want to rebuild its
+formatting):
+
+```bash
+docker compose run --rm -v $(pwd)/scripts/setup_categories_tab.py:/app/setup_categories_tab.py \
+    telcheck python3 setup_categories_tab.py
+```
 
 ## 6. Operational notes
 
