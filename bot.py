@@ -14,7 +14,19 @@ import sys
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import json
+from urllib.parse import urlencode
+
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -77,6 +89,10 @@ GOOGLE_CREDS_FILE = os.environ.get(
     "GOOGLE_SHEETS_CREDENTIALS_FILE", "/app/credentials/service_account.json"
 )
 GOOGLE_WORKSHEET_NAME = os.environ.get("GOOGLE_WORKSHEET_NAME", "Sheet1")
+# Public HTTPS URL of the reminders Mini App (docs/index.html served by GitHub
+# Pages). Optional - without it, /reminders still works by typing times.
+REMINDERS_WEBAPP_URL = os.environ.get("REMINDERS_WEBAPP_URL", "").strip()
+MAX_REMINDERS = 12
 
 # Set once in main() before polling starts. Kept out of bot_data/chat_data since
 # PicklePersistence replaces bot_data wholesale on startup and can't pickle a
@@ -89,13 +105,14 @@ SHEETS: "SheetsClient | None" = None
 
 CB_CHECKIN_YES = "checkin:yes"
 CB_CHECKIN_NO = "checkin:no"
-CB_TRACK_YES = "track:yes"
-CB_TRACK_NO = "track:no"
-CB_WAS_YES = "was:yes"
-CB_WAS_NO = "was:no"
 
 JOB_NAME_PREFIX = "checkin_"
 TIMEOUT_JOB_NAME_PREFIX = "checkin_timeout_"
+REMINDER_JOB_NAME_PREFIX = "reminder_"
+
+
+def reminder_job_name(chat_id: int) -> str:
+    return f"{REMINDER_JOB_NAME_PREFIX}{chat_id}"
 
 
 def job_name(chat_id: int) -> str:
@@ -382,7 +399,7 @@ async def set_new_task(
 
 
 async def resolve_unanswered_checkin_as_no(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """No response to the last check-in - treat it like an unattended No -> No: pause."""
+    """No response to the last check-in - treat it like an unattended No: pause."""
     chat_data = context.chat_data
     if not chat_data.get("awaiting_checkin_response"):
         return
@@ -455,8 +472,188 @@ async def send_checkin_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # --------------------------------------------------------------------------
+# Daily "start tracking" reminders
+# --------------------------------------------------------------------------
+# Stored per chat as chat_data["reminders"] = sorted list of "HH:MM" (24h, in
+# TZ). Each time gets its own run_daily job, all sharing one job name so they
+# can be cancelled together when the list changes.
+
+_HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def normalize_reminders(times) -> list:
+    """Validate, dedupe and sort a list of "HH:MM" strings. Raises ValueError on a bad entry."""
+    result = set()
+    for t in times:
+        t = str(t).strip()
+        if not _HHMM_RE.match(t):
+            raise ValueError(t)
+        result.add(t)
+    if len(result) > MAX_REMINDERS:
+        raise ValueError(f"too many (max {MAX_REMINDERS})")
+    return sorted(result)
+
+
+def parse_reminder_text(text: str) -> list:
+    """Parse typed times like "9am, 1:30 pm, 16:00" into sorted "HH:MM" strings."""
+    times = []
+    for piece in re.split(r"[,;]+", text):
+        piece = re.sub(r"\s+", "", piece)
+        if not piece:
+            continue
+        parsed = parse_clock_time(piece, TIMEZONE)
+        if parsed is None:
+            raise ValueError(piece)
+        times.append(parsed.strftime("%H:%M"))
+    return normalize_reminders(times)
+
+
+def format_reminder(hhmm: str) -> str:
+    return datetime.strptime(hhmm, "%H:%M").strftime("%I:%M %p").lstrip("0")
+
+
+def format_reminder_list(times: list) -> str:
+    return ", ".join(format_reminder(t) for t in times) if times else "none"
+
+
+def schedule_reminders(application: Application, chat_id: int, times: list) -> None:
+    """Replace this chat's reminder jobs with one daily job per time."""
+    for job in application.job_queue.get_jobs_by_name(reminder_job_name(chat_id)):
+        job.schedule_removal()
+    for hhmm in times:
+        hour, minute = map(int, hhmm.split(":"))
+        application.job_queue.run_daily(
+            send_reminder,
+            time=dt_time(hour=hour, minute=minute, tzinfo=TIMEZONE),
+            chat_id=chat_id,
+            name=reminder_job_name(chat_id),
+            data=hhmm,
+        )
+    logger.info("Scheduled %d reminder(s) for chat %s: %s", len(times), chat_id, times)
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Purely informational - no buttons, no state changes, no expected reply.
+    await context.bot.send_message(chat_id=context.job.chat_id, text="⏰ Reminder: track your tasks.")
+
+
+def _reminders_keyboard(times: list) -> "ReplyKeyboardMarkup | None":
+    if not REMINDERS_WEBAPP_URL:
+        return None
+    # Current times ride along in the query string so the page can show them;
+    # (Telegram uses the URL #hash for its own launch params).
+    sep = "&" if "?" in REMINDERS_WEBAPP_URL else "?"
+    url = f"{REMINDERS_WEBAPP_URL}{sep}{urlencode({'r': ','.join(times), 'tz': str(TIMEZONE)})}"
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("⏰ Edit reminders", web_app=WebAppInfo(url=url))]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+async def _save_reminders(context: ContextTypes.DEFAULT_TYPE, chat_id: int, times: list) -> None:
+    context.chat_data["reminders"] = times
+    schedule_reminders(context.application, chat_id, times)
+
+
+@restricted
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    current = context.chat_data.get("reminders", [])
+
+    if context.args:
+        raw = " ".join(context.args).strip()
+        if raw.lower() in ("off", "clear", "none"):
+            times = []
+        else:
+            try:
+                times = parse_reminder_text(raw)
+            except ValueError as exc:
+                await update.message.reply_text(
+                    f"Couldn't read {exc}. Use times like /reminders 9am, 1:30pm, 16:00 "
+                    "(or /reminders off)."
+                )
+                return
+        await _save_reminders(context, chat_id, times)
+        await update.message.reply_text(
+            f"Daily reminders set: {format_reminder_list(times)}.", reply_markup=ReplyKeyboardRemove()
+        )
+        return
+
+    keyboard = _reminders_keyboard(current)
+    lines = [f"Daily reminders: {format_reminder_list(current)}"]
+    if keyboard:
+        lines.append("Tap ⏰ Edit reminders below to change them.")
+    lines.append("Or type them: /reminders 9am, 1:30pm, 4pm (/reminders off to clear).")
+    await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+
+@restricted
+async def on_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reminders submitted from the Mini App via Telegram.WebApp.sendData()."""
+    chat_id = update.effective_chat.id
+    raw = update.effective_message.web_app_data.data
+    try:
+        payload = json.loads(raw)
+        times = normalize_reminders(payload.get("reminders", []))
+    except (ValueError, AttributeError, TypeError):
+        logger.warning("Rejected Mini App payload: %r", raw)
+        await update.effective_message.reply_text(
+            "Couldn't read those reminder times, nothing changed.", reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    await _save_reminders(context, chat_id, times)
+    await update.effective_message.reply_text(
+        f"✅ Daily reminders saved: {format_reminder_list(times)}.", reply_markup=ReplyKeyboardRemove()
+    )
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
+
+# Single source of truth for the command list: drives both the "/" menu
+# Telegram shows (registered via set_my_commands at startup) and /help.
+# (name, short menu description, usage line, longer help text)
+COMMANDS = [
+    ("task", "Start or switch to a task", "/task [HH:MMam/pm] <name>",
+     "Start tracking a task (closes out the current one). Optional leading time backdates the start, "
+     "e.g. /task 1:30pm work: standup."),
+    ("status", "Show the current task and time on it", "/status",
+     "Current task, whether it's active or paused, when it started, and time on task."),
+    ("pause", "Pause the current task", "/pause",
+     "Pause tracking and stop check-ins. Resumable today with /resume."),
+    ("resume", "Resume a paused task", "/resume",
+     "Pick a paused task back up and restart check-ins. /start does the same."),
+    ("stop", "Stop the current task for good", "/stop",
+     "End the current task (logged Inactive). Start something new with /task."),
+    ("rename", "Rename the current task", "/rename <new name>",
+     "Relabel the current task in place. Same session, same running time."),
+    ("was", "Backfill a task you forgot to track", "/was <name>",
+     f"Log a task for the gap since tracking last stopped (up to {CHECKIN_INTERVAL_MINUTES:g} min back). "
+     "Only when nothing is active."),
+    ("reminders", "Set daily reminders to start tracking", "/reminders [times]",
+     "Show or edit your daily start-tracking reminders. Opens the editor, or type them: "
+     "/reminders 9am, 1:30pm, 4pm (or /reminders off)."),
+    ("help", "List all commands", "/help", "Show this list."),
+]
+
+
+@restricted
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["*Commands*", ""]
+    for _name, _desc, usage, details in COMMANDS:
+        lines.append(f"`{usage}`\n{details}\n")
+    lines.append("Tip: prefix a task with `category:` (e.g. `work: standup`) to group it in the Categories tab.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def register_bot_commands(application: Application) -> None:
+    """Publish the command list so Telegram shows it in the "/" menu."""
+    try:
+        await application.bot.set_my_commands([BotCommand(name, desc) for name, desc, _u, _d in COMMANDS])
+    except Exception:
+        logger.exception("Failed to register bot commands with Telegram")
 
 
 @restricted
@@ -639,15 +836,22 @@ async def cmd_was(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     duration = format_duration((now - start).total_seconds())
-    context.chat_data["pending_was"] = {"task": task_name, "start": start, "end": now, "duration": duration}
-
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Yes", callback_data=CB_WAS_YES), InlineKeyboardButton("No", callback_data=CB_WAS_NO)]]
-    )
+    try:
+        await asyncio.to_thread(
+            SHEETS.log_entry,
+            task_name,
+            "Inactive",
+            format_date(start),
+            format_time(start),
+            format_timestamp(now),
+        )
+    except Exception:
+        await _notify_sheet_error(context, chat_id, task_name, "Inactive")
+        return
+    context.chat_data["last_stopped_at"] = now
     await update.message.reply_text(
-        f"Log *{task_name}* from {start.strftime('%a %I:%M %p')} to "
-        f"{now.strftime('%a %I:%M %p')} ({duration})?",
-        reply_markup=keyboard,
+        f"Logged *{task_name}* from {start.strftime('%a %I:%M %p')} to "
+        f"{now.strftime('%a %I:%M %p')} ({duration}).",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -672,88 +876,24 @@ async def on_checkin_response(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.data == CB_CHECKIN_YES:
         await query.edit_message_text(f"Got it! Staying on *{task}*.", parse_mode=ParseMode.MARKDOWN)
     elif query.data == CB_CHECKIN_NO:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Yes", callback_data=CB_TRACK_YES),
-                    InlineKeyboardButton("No", callback_data=CB_TRACK_NO),
-                ]
-            ]
-        )
-        await query.edit_message_text(
-            "Do you have anything else you want to track?", reply_markup=keyboard
-        )
-
-
-@restricted
-async def on_track_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-
-    if query.data == CB_TRACK_YES:
-        context.chat_data["awaiting_new_task_name"] = True
-        await query.edit_message_text("What's the name of the new task? Just type it below.")
-    elif query.data == CB_TRACK_NO:
+        # Pause rather than close: the task stays resumable, and whatever comes
+        # next gets logged with /task (which closes this one out as Inactive).
         cancel_checkin_loop(context.application, chat_id)
         await pause_session(context, chat_id)
         context.chat_data["status"] = "paused"
         await query.edit_message_text(
-            "Okay, pausing all check-ins. Send /resume (or /task <task name>) whenever "
-            "you want to continue."
-        )
-
-
-@restricted
-async def on_was_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    pending = context.chat_data.pop("pending_was", None)
-
-    if query.data == CB_WAS_YES:
-        if not pending:
-            await query.edit_message_text("Something went wrong — please run /was again.")
-            return
-        task_name, start, end, duration = pending["task"], pending["start"], pending["end"], pending["duration"]
-        try:
-            await asyncio.to_thread(
-                SHEETS.log_entry,
-                task_name,
-                "Inactive",
-                format_date(start),
-                format_time(start),
-                format_timestamp(end),
-            )
-        except Exception:
-            await _notify_sheet_error(context, chat_id, task_name, "Inactive")
-            return
-        context.chat_data["last_stopped_at"] = end
-        await query.edit_message_text(
-            f"Logged *{task_name}* from {start.strftime('%a %I:%M %p')} to "
-            f"{end.strftime('%a %I:%M %p')} ({duration}).",
+            f"Paused *{task}*. Log your next task with /task <name> "
+            "(or /resume to pick this one back up).",
             parse_mode=ParseMode.MARKDOWN,
         )
-    else:
-        await query.edit_message_text("Okay, discarded.")
 
 
 @restricted
 async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    if context.chat_data.get("awaiting_new_task_name"):
-        task_name = update.message.text.strip()
-        await set_new_task(context, chat_id, task_name)
-        await update.message.reply_text(
-            f"Switched to tracking *{task_name}*. Check-ins will resume every "
-            f"{CHECKIN_INTERVAL_MINUTES:g} minutes.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    else:
-        await update.message.reply_text(
-            "I didn't understand that. Use /task <task name> to set a task, or /status "
-            "to check current status."
-        )
+    await update.message.reply_text(
+        "I didn't understand that. Use /task <task name> to set a task, /status "
+        "to check current status, or /help for all commands."
+    )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -773,6 +913,8 @@ async def restore_jobs_on_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info(
                 "Restored check-in loop for chat %s (task=%r)", chat_id, data.get("current_task")
             )
+        if data.get("reminders"):
+            schedule_reminders(application, chat_id, data["reminders"])
 
 
 async def end_of_day_sweep(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -809,8 +951,15 @@ def main() -> None:
         sys.exit(1)
 
     persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
-    application = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(register_bot_commands)
+        .build()
+    )
 
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("start", cmd_resume))
     application.add_handler(CommandHandler("resume", cmd_resume))
     application.add_handler(CommandHandler("task", cmd_task))
@@ -819,14 +968,10 @@ def main() -> None:
     application.add_handler(CommandHandler("stop", cmd_stop))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("was", cmd_was))
+    application.add_handler(CommandHandler("reminders", cmd_reminders))
+    application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, on_web_app_data))
     application.add_handler(
         CallbackQueryHandler(on_checkin_response, pattern=f"^(?:{CB_CHECKIN_YES}|{CB_CHECKIN_NO})$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(on_track_response, pattern=f"^(?:{CB_TRACK_YES}|{CB_TRACK_NO})$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(on_was_response, pattern=f"^(?:{CB_WAS_YES}|{CB_WAS_NO})$")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
     application.add_error_handler(on_error)
