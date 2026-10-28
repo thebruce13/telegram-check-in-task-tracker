@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tracking reminders</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --bg2: var(--tg-theme-secondary-bg-color, #f2f2f7);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #8e8e93);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --accent-text: var(--tg-theme-button-text-color, #ffffff);
+    --danger: var(--tg-theme-destructive-text-color, #e53935);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 16px 96px;
+    background: var(--bg2); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 20px; margin: 4px 4px 4px; }
+  .sub { color: var(--hint); font-size: 14px; margin: 0 4px 16px; }
+  .card { background: var(--bg); border-radius: 12px; overflow: hidden; margin-bottom: 16px; }
+  .row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 16px; border-bottom: 1px solid var(--bg2);
+  }
+  .row:last-child { border-bottom: none; }
+  .time { font-size: 22px; font-variant-numeric: tabular-nums; }
+  .remove {
+    background: none; border: none; color: var(--danger);
+    font-size: 15px; padding: 6px 8px; cursor: pointer;
+  }
+  .empty { padding: 20px 16px; color: var(--hint); text-align: center; }
+  .add { display: flex; gap: 8px; padding: 12px 16px; }
+  .add input {
+    flex: 1; font-size: 18px; padding: 8px 10px; border-radius: 8px;
+    border: 1px solid var(--hint); background: var(--bg); color: var(--text);
+  }
+  .btn {
+    border: none; border-radius: 8px; padding: 10px 16px; font-size: 16px;
+    background: var(--accent); color: var(--accent-text); cursor: pointer;
+  }
+  .btn:disabled { opacity: .4; }
+  .label { color: var(--hint); font-size: 13px; text-transform: uppercase; margin: 0 16px 6px; }
+  .presets { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 14px; }
+  .chip {
+    border: 1px solid var(--accent); color: var(--accent); background: none;
+    border-radius: 16px; padding: 5px 12px; font-size: 14px; cursor: pointer;
+  }
+  #save-fallback { width: 100%; margin-top: 8px; display: none; }
+  .note { color: var(--hint); font-size: 13px; margin: 0 4px; }
+</style>
+</head>
+<body>
+  <h1>⏰ Tracking reminders</h1>
+  <p class="sub" id="sub">Every day at these times, the bot nudges you to start tracking.</p>
+
+  <div class="card" id="list"></div>
+
+  <div class="card">
+    <div class="add">
+      <input type="time" id="new-time" value="09:00" aria-label="New reminder time">
+      <button class="btn" id="add-btn">Add</button>
+    </div>
+    <div class="label">Quick add</div>
+    <div class="presets" id="presets"></div>
+  </div>
+
+  <p class="note" id="limit-note"></p>
+  <button class="btn" id="save-fallback">Save</button>
+
+<script>
+(function () {
+  "use strict";
+  var MAX = 12;
+  var PRESETS = ["08:00", "09:00", "12:00", "13:00", "15:00", "17:00"];
+  var tg = window.Telegram && window.Telegram.WebApp;
+  // platform is "unknown" when the page is opened outside Telegram.
+  var inTelegram = !!(tg && tg.platform && tg.platform !== "unknown");
+  var params = new URLSearchParams(location.search);
+  var valid = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+  var initial = (params.get("r") || "").split(",").filter(function (t) { return valid.test(t); });
+  var times = Array.from(new Set(initial)).sort();
+  var original = times.join(",");
+
+  var tz = params.get("tz");
+  if (tz) document.getElementById("sub").textContent += " (" + tz + ")";
+
+  function fmt(t) {
+    var h = +t.slice(0, 2), m = t.slice(3);
+    var ap = h < 12 ? "AM" : "PM";
+    return ((h % 12) || 12) + ":" + m + " " + ap;
+  }
+
+  function changed() { return times.join(",") !== original; }
+
+  function render() {
+    var list = document.getElementById("list");
+    list.innerHTML = "";
+    if (!times.length) {
+      list.innerHTML = '<div class="empty">No reminders yet. Add a time below.</div>';
+    }
+    times.forEach(function (t) {
+      var row = document.createElement("div");
+      row.className = "row";
+      var span = document.createElement("span");
+      span.className = "time";
+      span.textContent = fmt(t);
+      var rm = document.createElement("button");
+      rm.className = "remove";
+      rm.textContent = "Remove";
+      rm.onclick = function () { times = times.filter(function (x) { return x !== t; }); render(); };
+      row.appendChild(span);
+      row.appendChild(rm);
+      list.appendChild(row);
+    });
+
+    var presets = document.getElementById("presets");
+    presets.innerHTML = "";
+    PRESETS.filter(function (p) { return times.indexOf(p) < 0; }).forEach(function (p) {
+      var c = document.createElement("button");
+      c.className = "chip";
+      c.textContent = "+ " + fmt(p);
+      c.onclick = function () { add(p); };
+      presets.appendChild(c);
+    });
+
+    var full = times.length >= MAX;
+    document.getElementById("add-btn").disabled = full;
+    document.getElementById("limit-note").textContent = full ? "That's the maximum of " + MAX + " reminders." : "";
+
+    var label = times.length ? "Save " + times.length + " reminder" + (times.length > 1 ? "s" : "") : "Turn off reminders";
+    if (inTelegram) {
+      tg.MainButton.setText(label);
+      if (changed()) tg.MainButton.show(); else tg.MainButton.hide();
+    }
+    var fb = document.getElementById("save-fallback");
+    fb.textContent = label;
+    fb.disabled = !changed();
+  }
+
+  function add(t) {
+    if (!valid.test(t) || times.indexOf(t) >= 0 || times.length >= MAX) return;
+    times.push(t);
+    times.sort();
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+    render();
+  }
+
+  function save() {
+    var payload = JSON.stringify({ reminders: times });
+    if (inTelegram) {
+      tg.sendData(payload); // closes the Mini App and delivers the data to the bot
+    } else {
+      alert("Open this from the bot's ⏰ Edit reminders button to save.\n\n" + payload);
+    }
+  }
+
+  document.getElementById("add-btn").onclick = function () {
+    add(document.getElementById("new-time").value);
+  };
+  document.getElementById("save-fallback").onclick = save;
+
+  if (inTelegram) {
+    tg.ready();
+    tg.expand();
+    tg.MainButton.onClick(save);
+  } else {
+    // Opened in a normal browser (e.g. for a preview): show an on-page Save button.
+    document.getElementById("save-fallback").style.display = "block";
+  }
+  render();
+})();
+</script>
+</body>
+</html>

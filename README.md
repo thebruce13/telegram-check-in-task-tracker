@@ -9,20 +9,16 @@ on your home server. Everything was vibe-coded even this readme, fight me.
 - Every `CHECKIN_INTERVAL_MINUTES` (default 30) the bot sends: *"Are you still
   working on **&lt;task&gt;**?"* with **Yes** / **No** buttons.
 - **No response within `CHECKIN_INTERVAL_MINUTES - 1` minutes** (29 by
-  default) → the prompt is auto-resolved as if you'd answered No → No: the
+  default) → the prompt is auto-resolved as if you'd answered No: the
   task is paused, and the original message is edited to say so. This also
   means a second check-in can never stack on an unanswered one — the stale
   one always resolves first.
 - **Yes** → just replies with a short confirmation and the loop continues on
   schedule. Nothing is written to the sheet — the task's row is already
   `Active`.
-- **No** → asks *"Do you have anything else you want to track?"*
-  - **Yes** → asks you to type the new task name. Once you send it, the bot
-    logs `(timestamp, previous_task, "Inactive")` (the old task is done for
-    good), then `(timestamp, new_task, "Active")`, makes the new task
-    current, and restarts the 30-minute loop from now.
-  - **No** → logs `(timestamp, task, "Paused")`, cancels all reminders, and
-    stays silent until you send `/resume`, `/start`, or `/task <name>`.
+- **No** → pauses the task (logged `Paused`), stops check-ins, and tells
+  you to log your next task with `/task <name>`. No follow-up questions.
+  The paused task can still be picked back up with `/resume`.
 - Running `/task <name>` always switches immediately, no confirmation —
   whatever was current (active, paused, or nothing) gets logged `Inactive`
   and the new task starts `Active`, restarting the 30-minute loop.
@@ -168,6 +164,8 @@ bot.
 TelCheck/
 ├── bot.py                  # Main application
 ├── sheets_client.py        # Google Sheets wrapper
+├── docs/
+│   └── index.html          # Reminders Mini App (served by GitHub Pages)
 ├── scripts/
 │   └── setup_categories_tab.py  # One-off: (re)creates the Categories tab
 ├── requirements.txt
@@ -232,7 +230,7 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
   as `Paused` (with its duration so far) and cancels reminders. Resumable the
   same day via `/resume` or `/start`; if left paused past midnight, the
   end-of-day sweep logs it `Inactive` automatically. Equivalent to answering
-  No → No to a check-in prompt.
+  No to a check-in prompt.
 - `/stop` — hard stop: ends tracking for good, not just a pause. Logs the
   current task `Inactive` (with its duration) and cancels reminders. There's
   no automatic way back — start something new with `/task <name>`.
@@ -246,14 +244,23 @@ telcheck | ... TelCheck starting (interval=30.0 min, tz=America/New_York)
   time between now and whenever tracking last stopped (via `/pause`,
   `/stop`, or an unanswered check-in), capped at `CHECKIN_INTERVAL_MINUTES`
   so it never reaches further back than the bot could actually vouch for.
-  Shows a Yes/No confirmation with the computed start/end times before
-  writing anything. Logs a single already-`Inactive` row directly — it
+  Logs immediately, no confirmation, and replies with the start/end times
+  and duration it used. Writes a single already-`Inactive` row — it
   doesn't touch whatever's currently paused/stopped, and doesn't start a
   check-in loop. Only works when nothing is currently *active* (if
   something is, there's no gap to fill — `/pause` or `/stop` it first).
   Example: you ran `/task cleanup` 1:00–1:30pm, then stopped responding to
   check-ins; at 1:45pm you run `/was "making a mess"` — it logs "making a
   mess" from 1:30pm (when `cleanup` was last known to stop) to 1:45pm (now).
+
+- `/reminders` — show your daily "start tracking" reminders, with an
+  **⏰ Edit reminders** button that opens a small Mini App inside Telegram
+  for adding and removing times (see [Reminders](#reminders) below). You can
+  also set them by typing: `/reminders 9am, 1:30pm, 16:00`, or
+  `/reminders off` to clear them all.
+- `/help` — list every command with a short description. The bot also
+  registers its commands with Telegram on startup, so typing `/` in the chat
+  (or tapping **Menu**) shows them as autocomplete.
 
 From there, just respond to the periodic Yes/No prompts. Every task gets one
 row in your Google Sheet that's updated in place as it changes state:
@@ -288,6 +295,34 @@ formatting):
 docker compose run --rm -v $(pwd)/scripts/setup_categories_tab.py:/app/setup_categories_tab.py \
     telcheck python3 setup_categories_tab.py
 ```
+
+### Reminders
+
+Daily reminders send a simple "⏰ Reminder: track your tasks." message at
+set times (in your `TZ`), every day. They're just a nudge: no buttons, no
+reply expected, and they don't change anything about what's being tracked.
+
+Reminder times are saved in the bot's persisted state and survive restarts.
+
+**The Mini App.** `docs/index.html` is a static page with time pickers. The
+bot opens it from a keyboard button and passes in your current times. On
+save, the page sends the new list straight back to the bot through
+Telegram (`Telegram.WebApp.sendData`). It doesn't need a server and doesn't
+need your home server to be reachable from the internet. It just has to
+be hosted somewhere public over HTTPS, and GitHub Pages works for that:
+
+1. On GitHub, open the repo's **Settings → Pages**. Under **Build and
+   deployment**, set the source to **Deploy from a branch**, branch
+   `main`, folder `/docs`, then save.
+2. After a minute it's live at
+   `https://<your-github-user>.github.io/telegram-check-in-task-tracker/`.
+   Put that URL in `.env` as `REMINDERS_WEBAPP_URL` and
+   `docker compose up -d --build`.
+
+The page holds no data and no secrets. Anyone can open the URL, but only a
+save sent through Telegram by your configured user ID is accepted by the
+bot. If `REMINDERS_WEBAPP_URL` is unset, `/reminders` simply skips the
+button and you set times by typing them.
 
 ## 6. Operational notes
 
